@@ -1,0 +1,12 @@
+{
+  "name": "ai-grade-cloudrun",
+  "version": "1.0.0",
+  "description": "AI 批改云托管服务：一张图直接给大模型，一次输出全部题的判定（突破云函数 60s 限制）",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}
