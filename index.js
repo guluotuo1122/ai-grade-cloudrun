@@ -55,12 +55,12 @@ function extractGradings(text) {
   }
 }
 
-/** 调用 DashScope OpenAI 兼容接口（非流式，云托管无 60s 限制，可等 3 分钟） */
-function callDashScope({ apiKey, model, imageUrl, prompt }) {
+/** 调用 DashScope OpenAI 兼容接口（流式 stream:true，边生成边回调 onDelta，避免网关空闲超时） */
+function callDashScopeStream({ apiKey, model, imageUrl, prompt, onDelta }) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({
       model: model || DEFAULT_MODEL,
-      stream: false,
+      stream: true,
       messages: [
         {
           role: 'user',
@@ -81,25 +81,28 @@ function callDashScope({ apiKey, model, imageUrl, prompt }) {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Length': Buffer.byteLength(body)
       },
-      timeout: 180000 // 3 分钟（云托管无 60s 限制）
+      timeout: 180000 // 3 分钟
     }, (res) => {
-      const chunks = []
-      res.on('data', (c) => chunks.push(c))
-      res.on('end', () => {
-        const text = Buffer.concat(chunks).toString('utf-8')
-        try {
-          const data = JSON.parse(text)
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            const content = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || ''
-            resolve(content)
-          } else {
-            const msg = (data.error && (data.error.message || data.error.code)) || text.slice(0, 200)
-            reject(new Error(`DashScope 接口错误(${res.statusCode}): ${msg}`))
-          }
-        } catch (e) {
-          reject(new Error('DashScope 响应解析失败: ' + text.slice(0, 200)))
+      let buffer = ''
+      res.on('data', (chunk) => {
+        buffer += chunk.toString('utf-8')
+        // 解析 SSE 行（data: {...}）
+        let idx
+        while ((idx = buffer.indexOf('\n')) !== -1) {
+          const line = buffer.slice(0, idx).trim()
+          buffer = buffer.slice(idx + 1)
+          if (!line.startsWith('data:')) continue
+          const data = line.slice(5).trim()
+          if (data === '[DONE]') continue
+          try {
+            const obj = JSON.parse(data)
+            const delta = obj.choices && obj.choices[0] && obj.choices[0].delta && obj.choices[0].delta.content
+            if (delta && onDelta) onDelta(delta)
+          } catch (e) { /* 忽略解析失败的行 */ }
         }
       })
+      res.on('end', resolve)
+      res.on('error', reject)
     })
     req.on('error', (e) => reject(new Error('DashScope 网络错误: ' + e.message)))
     req.on('timeout', () => req.destroy(new Error('DashScope 超时(180s)')))
@@ -140,22 +143,53 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
-  // 批改
+  // 批改（流式：立即响应头 + 边生成边发心跳，避免网关 60s 空闲超时返回 504）
   if (req.method === 'POST' && req.url === '/grade') {
+    const raw = await readBody(req)
+    let imageUrl, apiKey, model, prompt
     try {
-      const raw = await readBody(req)
-      const { imageUrl, apiKey, model, prompt } = JSON.parse(raw || '{}')
-      if (!imageUrl) throw new Error('缺少 imageUrl（图片 https 地址）')
-      const key = apiKey || process.env.DASHSCOPE_API_KEY
-      if (!key) throw new Error('缺少 API Key：请求体传 apiKey，或云托管环境变量配 DASHSCOPE_API_KEY')
+      const p = JSON.parse(raw || '{}')
+      imageUrl = p.imageUrl; apiKey = p.apiKey; model = p.model; prompt = p.prompt
+    } catch (e) {
+      res.writeHead(400, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ success: false, message: '请求体不是合法 JSON' }))
+      return
+    }
 
-      const content = await callDashScope({ apiKey: key, model, imageUrl, prompt: prompt || GRADE_PROMPT })
+    if (!imageUrl) {
+      res.writeHead(400, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ success: false, message: '缺少 imageUrl（图片 https 地址）' }))
+      return
+    }
+    const key = apiKey || process.env.DASHSCOPE_API_KEY
+    if (!key) {
+      res.writeHead(400, { 'Content-Type': 'application/json' })
+      res.end(JSON.stringify({ success: false, message: '缺少 API Key' }))
+      return
+    }
+
+    // 立即写响应头（chunked + 禁用网关缓冲，让心跳立即转发）
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Cache-Control': 'no-cache',
+      'X-Accel-Buffering': 'no'
+    })
+
+    try {
+      let content = ''
+      await callDashScopeStream({
+        apiKey: key,
+        model,
+        imageUrl,
+        prompt: prompt || GRADE_PROMPT,
+        onDelta: (delta) => {
+          content += delta
+          res.write(' ') // 心跳：每收到 delta 就写数据，保持连接活跃，防网关超时
+        }
+      })
       const gradings = extractGradings(content)
-
-      res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ success: true, count: gradings.length, gradings }))
     } catch (e) {
-      res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ success: false, message: (e && e.message) || '处理失败' }))
     }
     return
