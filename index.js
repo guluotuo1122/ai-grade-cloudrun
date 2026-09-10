@@ -55,12 +55,12 @@ function extractGradings(text) {
   }
 }
 
-/** 调用 DashScope OpenAI 兼容接口（流式 stream:true，边生成边回调 onDelta，避免网关空闲超时） */
-function callDashScopeStream({ apiKey, model, imageUrl, prompt, onDelta }) {
+/** 调用 DashScope OpenAI 兼容接口（非流式 stream:false，云托管端用 setInterval 心跳保网关连接） */
+function callDashScope({ apiKey, model, imageUrl, prompt }) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({
       model: model || DEFAULT_MODEL,
-      stream: true,
+      stream: false,
       messages: [
         {
           role: 'user',
@@ -81,28 +81,25 @@ function callDashScopeStream({ apiKey, model, imageUrl, prompt, onDelta }) {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Length': Buffer.byteLength(body)
       },
-      timeout: 180000 // 3 分钟
+      timeout: 180000 // 3 分钟（云托管无 60s 限制）
     }, (res) => {
-      let buffer = ''
-      res.on('data', (chunk) => {
-        buffer += chunk.toString('utf-8')
-        // 解析 SSE 行（data: {...}）
-        let idx
-        while ((idx = buffer.indexOf('\n')) !== -1) {
-          const line = buffer.slice(0, idx).trim()
-          buffer = buffer.slice(idx + 1)
-          if (!line.startsWith('data:')) continue
-          const data = line.slice(5).trim()
-          if (data === '[DONE]') continue
-          try {
-            const obj = JSON.parse(data)
-            const delta = obj.choices && obj.choices[0] && obj.choices[0].delta && obj.choices[0].delta.content
-            if (delta && onDelta) onDelta(delta)
-          } catch (e) { /* 忽略解析失败的行 */ }
+      const chunks = []
+      res.on('data', (c) => chunks.push(c))
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf-8')
+        try {
+          const data = JSON.parse(text)
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            const content = (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || ''
+            resolve(content)
+          } else {
+            const msg = (data.error && (data.error.message || data.error.code)) || text.slice(0, 200)
+            reject(new Error(`DashScope 接口错误(${res.statusCode}): ${msg}`))
+          }
+        } catch (e) {
+          reject(new Error('DashScope 响应解析失败: ' + text.slice(0, 200)))
         }
       })
-      res.on('end', resolve)
-      res.on('error', reject)
     })
     req.on('error', (e) => reject(new Error('DashScope 网络错误: ' + e.message)))
     req.on('timeout', () => req.destroy(new Error('DashScope 超时(180s)')))
@@ -168,28 +165,35 @@ const server = http.createServer(async (req, res) => {
       return
     }
 
-    // 立即写响应头（chunked + 禁用网关缓冲，让心跳立即转发）
+    // 立即写响应头（chunked + 禁用网关缓冲）
     res.writeHead(200, {
       'Content-Type': 'application/json',
       'Cache-Control': 'no-cache',
       'X-Accel-Buffering': 'no'
     })
 
+    // 云托管端主动心跳：每 4 秒写一个空格，保持网关连接活跃，
+    // 即使模型处理 60~120s 期间也不触发网关 60s 空闲超时
+    const heartbeat = setInterval(() => {
+      try { res.write(' ') } catch (e) { /* 连接已断 */ }
+    }, 4000)
+
     try {
-      let content = ''
-      await callDashScopeStream({
+      console.log('[ai-grade] 开始批改, model=' + (model || DEFAULT_MODEL) + ', imageUrl=' + imageUrl.slice(0, 80))
+      const content = await callDashScope({
         apiKey: key,
         model,
         imageUrl,
-        prompt: prompt || GRADE_PROMPT,
-        onDelta: (delta) => {
-          content += delta
-          res.write(' ') // 心跳：每收到 delta 就写数据，保持连接活跃，防网关超时
-        }
+        prompt: prompt || GRADE_PROMPT
       })
+      clearInterval(heartbeat)
+      console.log('[ai-grade] DashScope 返回, content长度=' + content.length)
       const gradings = extractGradings(content)
+      console.log('[ai-grade] 解析 gradings 数量=' + gradings.length)
       res.end(JSON.stringify({ success: true, count: gradings.length, gradings }))
     } catch (e) {
+      clearInterval(heartbeat)
+      console.error('[ai-grade] 批改失败:', e && e.message)
       res.end(JSON.stringify({ success: false, message: (e && e.message) || '处理失败' }))
     }
     return
