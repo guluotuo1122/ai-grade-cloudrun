@@ -25,15 +25,35 @@ const GRADE_PROMPT = `你是批卷老师。下方是一张试卷/作业的图片
 
 对每一题输出：
 - question：该题题干（只抄该题本身；不含大题标题如"2 ★★ Complete the questions..."、不含大题要求如"Use the verbs in brackets"）
-- studentAnswer：学生手写答案（看不清/涂改/没写就填"未知"）
+- studentAnswer：学生手写答案（清晰、孤立、无涂改才填；被划掉/打叉/涂改/多笔 → 填"未知"）
 - verdict：correct（对）/ wrong（错）/ unsure（未写或看不清）
 - correctAnswer：正确答案（你自己分析题目得出，不抄卷面订正/红笔）
 - reason：一句话依据（≤30 字）
+
+【关键规则】
+- ★ 学生答案有涂改/划掉/打叉/订正/多笔叠写 → studentAnswer 填"未知"、verdict 填 unsure（宁可错报未知，不要错报一个错答案）
+- ★ correctAnswer 你自己解题得出，绝不抄卷面的订正/红笔答案
+- ★ 数学题选项字母 A/B/C/D ≠ 题目里的变量名（如"点C"），按数值匹配选项字母，不要按名称
 
 【输出 JSON，一次性输出所有题，图上有几题就输出几个对象，一个都不能漏】
 { "gradings": [ { "question":"题干", "studentAnswer":"学生答案或未知", "verdict":"correct", "correctAnswer":"正确答案", "reason":"依据" } ] }
 
 只输出 JSON，不要任何其他文字，不要 markdown 代码块。`
+
+/** 从模型返回文本提取 JSON 数组（容忍 markdown 代码块/前后缀） */
+function extractGradings(text) {
+  if (!text) return []
+  let t = String(text).replace(/```(json)?/gi, '')
+  const start = Math.min(...['{', '['].map((c) => { const i = t.indexOf(c); return i === -1 ? Infinity : i }))
+  const end = Math.max(t.lastIndexOf('}'), t.lastIndexOf(']'))
+  if (start === Infinity || end === -1 || end <= start) return []
+  try {
+    const obj = JSON.parse(t.slice(start, end + 1))
+    return Array.isArray(obj.gradings) ? obj.gradings : (Array.isArray(obj) ? obj : [])
+  } catch (e) {
+    return []
+  }
+}
 
 /** 调用 DashScope OpenAI 兼容接口（非流式，云托管无 60s 限制，可等 3 分钟） */
 function callDashScope({ apiKey, model, imageUrl, prompt }) {
@@ -130,9 +150,10 @@ const server = http.createServer(async (req, res) => {
       if (!key) throw new Error('缺少 API Key：请求体传 apiKey，或云托管环境变量配 DASHSCOPE_API_KEY')
 
       const content = await callDashScope({ apiKey: key, model, imageUrl, prompt: prompt || GRADE_PROMPT })
+      const gradings = extractGradings(content)
 
       res.writeHead(200, { 'Content-Type': 'application/json' })
-      res.end(JSON.stringify({ success: true, content }))
+      res.end(JSON.stringify({ success: true, count: gradings.length, gradings }))
     } catch (e) {
       res.writeHead(200, { 'Content-Type': 'application/json' })
       res.end(JSON.stringify({ success: false, message: (e && e.message) || '处理失败' }))
